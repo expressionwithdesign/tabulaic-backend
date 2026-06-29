@@ -5,3 +5,4 @@ anthropic==0.28.0
 pandas==2.2.2
 openpyxl==3.1.2
 xlrd==2.0.1
+stripe==9.12.0
