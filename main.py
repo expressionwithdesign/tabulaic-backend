@@ -2,65 +2,55 @@ import os, re, time, uuid, tempfile
 import pandas as pd
 import anthropic
 import stripe
-
+ 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-
+ 
 app = FastAPI(title="Tabulaic API", version="3.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
-
+ 
 FREE_ROW_LIMIT        = 1
 BATCH_SIZE            = 30
 ANTHROPIC_API_KEY     = os.environ.get("ANTHROPIC_API_KEY")
 STRIPE_SECRET_KEY     = os.environ.get("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 stripe.api_key = STRIPE_SECRET_KEY
-
+ 
 TIER_LIMITS = {
     "price_1Tnlr9RoZgDHWVTnMoItFrlt": 100,
     "price_1TnlsGRoZgDHWVTnYQBwcujz": 1000,
     "price_1TnltNRoZgDHWVTnPtrSfee2": 999999,
 }
 TOKEN_STORE: dict[str, int] = {}
-
-SYSTEM_PROMPT = """You are an expert Amazon listing optimization agent. Rewrite product titles and create Item Highlights that comply with Amazon's July 27, 2026 guidelines.
-
-TITLE RULES (max 75 chars HARD LIMIT):
-Structure: Brand + Core Product Type + Key Spec + Key Variant + Pack Count
-- Brand always first. If no brand detected, use "FoldCard"
-- Core product type: what it IS (e.g. "Math Poster", "Educational Chart")
-- Key spec: most important differentiator (size, material, grade level)
-- Key variant: secondary feature (e.g. "Double-Sided", subject)
-- Pack count: if applicable (e.g. "2 Pack", "5pk")
-- Capitalize major words. Use numerals not words. No punctuation except hyphens.
-- Remove ALL: promotional words (Best, Premium, Quality, Amazing), forbidden chars (! $ ? _ { } ^)
-- Count characters carefully. Never exceed 75.
-
-GOOD TITLE EXAMPLES:
-"FoldCard Math Educational Poster 11x17 Double-Sided 2 Pack" = 58 chars ✓
-"FoldCard Multiplication Chart Poster 8.5x11 5pk" = 47 chars ✓
-"FoldCard Spanish Alphabet Bilingual Poster 8.5x11 5pk" = 53 chars ✓
-
-ITEM HIGHLIGHTS RULES (max 120 chars HARD LIMIT):
-- Recapture keywords dropped from the title
-- Always include at least 3 of: kids, school supplies, classroom, homeschool, learning aid, decorations
-- Use semicolons to separate ideas. Be specific (subjects, grade level, material).
-- Natural readable English — not keyword stuffing
-- Count characters. Never exceed 120.
-
-GOOD HIGHLIGHTS EXAMPLES:
-"Addition, subtraction, multiplication & division; elementary classroom & homeschool learning aid for kids; school supplies" ✓
-"Bilingual English/Spanish; glossy cardstock; preschool-grade 3 classroom decorations; school supplies for kids" ✓
-
-OUTPUT FORMAT — output ONLY this, nothing else, no commentary:
-[ASIN or ROW_NUMBER]
-- **New Title (X chars):** [title]
-- **Item Highlights (Y chars):** [highlights]
+ 
+SYSTEM_PROMPT = """You are an expert Amazon Catalog Optimization Agent. Your sole task is to rewrite existing, long Amazon product titles to comply with the strict July 27, 2026 Title Update guidelines while defending organic keyword indexing.
+ 
+STRICT CONSTRAINTS & SEQUENCING:
+ 
+1. OPTIMIZED TITLE (Max 75 chars):
+   - Mandatory Structure: [Brand Name] + [Core Product Type/Keywords] + [Dimensions/Specs] + [Pack Count].
+   - CRITICAL BRAND RULE: The Brand Name MUST be the very first word in the title. If a brand name is already present inside the raw title, move it to the absolute front. If NO brand name is found anywhere in the provided text, automatically default and use "FoldCard" as the brand name prefix.
+   - Aggressively remove filler: Eliminate use-case stuffing, promotional fluff, marketing adjectives (e.g., "premium", "superb"), and redundant restatements.
+   - Style: Capitalize first letters of major words. Use numerals ("2") instead of words ("two"). No repeated words. No banned characters (!, $, ?, _, {, }, ^).
+ 
+2. ITEM HIGHLIGHTS (Max 125 chars):
+   - Recapture high-value search keywords dropped from the title (e.g., paper weights like 80lb/32lb, coating details like C2S, and end-use applications like brochures, flyers, crafting).
+   - Format as a dense, natural, or semi-structured phrase focusing on key specs, materials, compatibility, or what's included. Do not let it overflow past 125 characters.
+ 
+PROCESSING METHOD:
+- If a spreadsheet or multi-row text list is provided, process every row sequentially and return the output in the exact same order as the input.
+ 
+OUTPUT FORMAT:
+Return exactly this clean layout for every SKU with no extra conversational preamble or generic text:
+ 
+[ASIN / SKU]
+- **New Title (X chars):** [Your optimized title]
+- **Item Highlights (Y chars):** [Your item highlights text]
 ---"""
-
+ 
 def parse_upload(file_bytes, filename):
     ext = filename.lower().rsplit(".", 1)[-1]
     with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
@@ -81,7 +71,7 @@ def parse_upload(file_bytes, filename):
     df = df.dropna(subset=["title"]).reset_index(drop=True)
     if "asin" not in df.columns: df["asin"] = [f"ROW_{i+1}" for i in range(len(df))]
     return df[["asin","title"]]
-
+ 
 def parse_claude_response(text):
     results = []
     title_re     = re.compile(r"\*\*New Title \((\d+) chars?\):\*\*\s*(.+)", re.IGNORECASE)
@@ -95,7 +85,6 @@ def parse_claude_response(text):
             if tm: new_title = tm.group(2).strip()
             if hm: highlights = hm.group(2).strip()
         if new_title:
-            # Server-side hard enforcement as safety net
             new_title  = new_title[:75]
             highlights = highlights[:125]
             results.append({
@@ -103,7 +92,7 @@ def parse_claude_response(text):
                 "highlights": highlights, "highlight_chars": len(highlights)
             })
     return results
-
+ 
 def process_with_claude(df):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     all_results = []
@@ -119,7 +108,7 @@ def process_with_claude(df):
         print(f"  Processed rows {i+1}–{min(i+BATCH_SIZE, len(df))} of {len(df)}")
         if i + BATCH_SIZE < len(df): time.sleep(0.5)
     return all_results
-
+ 
 def build_excel(results, output_path):
     wb = Workbook(); ws = wb.active; ws.title = "Optimized Titles"
     thin   = Side(border_style="thin", color="CCCCCC")
@@ -134,7 +123,8 @@ def build_excel(results, output_path):
     center = Alignment(horizontal="center", vertical="top")
     for col, h in enumerate(["ASIN","New Title","Title Chars","Item Highlights","Highlights Chars"], 1):
         c = ws.cell(row=1, column=col, value=h)
-        c.font = hfont; c.fill = hfill; c.alignment = Alignment(horizontal="center", vertical="center"); c.border = border
+        c.font = hfont; c.fill = hfill
+        c.alignment = Alignment(horizontal="center", vertical="center"); c.border = border
     ws.row_dimensions[1].height = 30
     for ri, r in enumerate(results, 2):
         fill = altf if ri % 2 == 0 else None
@@ -148,13 +138,13 @@ def build_excel(results, output_path):
     ws.column_dimensions["C"].width = 13; ws.column_dimensions["D"].width = 68
     ws.column_dimensions["E"].width = 17; ws.freeze_panes = "A2"
     wb.save(output_path)
-
+ 
 @app.get("/")
 def root(): return {"status": "Tabulaic API running"}
-
+ 
 @app.get("/health")
 def health(): return {"status": "ok"}
-
+ 
 @app.post("/create-checkout-session")
 async def create_checkout_session(request: Request):
     body = await request.json()
@@ -171,7 +161,7 @@ async def create_checkout_session(request: Request):
         )
         return JSONResponse({"checkout_url": session.url})
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
-
+ 
 @app.post("/webhook")
 async def stripe_webhook(request: Request):
     payload    = await request.body()
@@ -185,7 +175,7 @@ async def stripe_webhook(request: Request):
         TOKEN_STORE[token] = TIER_LIMITS.get(price_id, FREE_ROW_LIMIT)
         print(f"Token issued: {token} → {TOKEN_STORE[token]} rows")
     return JSONResponse({"status": "ok"})
-
+ 
 @app.post("/process")
 async def process_file(file: UploadFile = File(...), x_token: str = Header(default=None)):
     if not ANTHROPIC_API_KEY: raise HTTPException(status_code=500, detail="API key not configured.")
@@ -206,7 +196,7 @@ async def process_file(file: UploadFile = File(...), x_token: str = Header(defau
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"X-Total-Rows": str(total_rows), "X-Processed-Rows": str(len(df_to_process))}
     )
-
+ 
 @app.post("/preview")
 async def preview_file(file: UploadFile = File(...)):
     file_bytes = await file.read()
